@@ -1,16 +1,15 @@
-import sys
-import os
 import ast
-from unittest.mock import patch, mock_open
 
 import pytest
 import yaml
 
-from vivarium.framework.components import (_import_by_path, load_component_manager, ComponentManager,
-                                           DummyDatasetManager, ComponentConfigError, _extract_component_list,
+from vivarium.configuration.config_tree import ConfigTree
+from vivarium.framework.components import (load_component_manager, ComponentManager,
+                                           DummyDatasetManager, _extract_component_list,
                                            _component_ast_to_path, _parse_component, ParsingError, _prep_components,
                                            _extract_component_call, _is_literal)
-
+from vivarium.framework.engine import build_simulation_configuration
+from vivarium.framework.util import import_by_path
 
 TEST_COMPONENTS = """
 components:
@@ -26,12 +25,12 @@ configuration:
         fall_dist: 10
 """
 TEST_CONFIG_CUSTOM_COMPONENT_MANAGER = """
-    vivarium:
-        component_manager: test_components.MockComponentManager
+vivarium:
+    component_manager: test_components.MockComponentManager
 """
 TEST_CONFIG_CUSTOM_DATASET_MANAGER = """
-    vivarium:
-        dataset_manager: test_components.MockDatasetManager
+vivarium:
+    dataset_manager: test_components.MockDatasetManager
 """
 
 
@@ -66,8 +65,11 @@ class MockComponentB(MockComponentA):
 def mock_component_c():
     pass
 
+
 def mock_importer(path):
     return {
+            'vivarium.framework.components.ComponentManager': ComponentManager,
+            'vivarium.framework.components.DummyDatasetManager': DummyDatasetManager,
             'test_components.MockComponentA': MockComponentA,
             'test_components.MockComponentB': MockComponentB,
             'test_components.mock_component_c': mock_component_c,
@@ -75,45 +77,60 @@ def mock_importer(path):
             'test_components.MockDatasetManager': MockDatasetManager,
             }[path]
 
+
+@pytest.fixture(scope='function')
+def _prep_components_mock(mocker):
+    return mocker.patch('vivarium.framework.components._prep_components')
+
+
+@pytest.fixture(scope='function')
+def _extract_component_list_mock(mocker):
+    return mocker.patch('vivarium.framework.components._extract_component_list')
+
+
 def test_import_class_by_path():
-    cls = _import_by_path('collections.abc.Set')
+    cls = import_by_path('collections.abc.Set')
     from collections.abc import Set
     assert cls is Set
 
 
 def test_import_function_by_path():
-    func = _import_by_path('vivarium.framework.components._import_by_path')
-    assert func is _import_by_path
+    func = import_by_path('vivarium.framework.util.import_by_path')
+    assert func is import_by_path
 
 
 def test_bad_import_by_path():
     with pytest.raises(ImportError):
-        _import_by_path('junk.garbage.SillyClass')
+        import_by_path('junk.garbage.SillyClass')
     with pytest.raises(AttributeError):
-        _import_by_path('vivarium.framework.components.SillyClass')
+        import_by_path('vivarium.framework.components.SillyClass')
+
 
 def test_load_component_manager_defaults():
-    manager = load_component_manager(component_config=yaml.load(TEST_COMPONENTS+TEST_CONFIG_DEFAULTS))
+    config = build_simulation_configuration()
+    config.update(TEST_COMPONENTS)
+    config.update(TEST_CONFIG_DEFAULTS)
+
+    manager = load_component_manager(config)
 
     assert isinstance(manager, ComponentManager)
     assert isinstance(manager.dataset_manager, DummyDatasetManager)
 
 
-@patch('vivarium.framework.components._import_by_path', mock_importer)
-def test_load_component_manager_custom_managers():
-    manager = load_component_manager(
-        component_config=yaml.load(TEST_COMPONENTS + TEST_CONFIG_DEFAULTS + TEST_CONFIG_CUSTOM_COMPONENT_MANAGER))
-    assert isinstance(manager, MockComponentManager)
+def test_load_component_manager_custom_managers(monkeypatch):
+    monkeypatch.setattr('vivarium.framework.components.import_by_path', mock_importer)
 
-    manager = load_component_manager(
-        component_config=yaml.load(TEST_COMPONENTS + TEST_CONFIG_DEFAULTS + TEST_CONFIG_CUSTOM_DATASET_MANAGER))
+    config = build_simulation_configuration()
+    config.update(TEST_COMPONENTS + TEST_CONFIG_DEFAULTS + TEST_CONFIG_CUSTOM_COMPONENT_MANAGER)
+    manager = load_component_manager(config)
+    assert isinstance(manager, MockComponentManager)
+    assert isinstance(manager.dataset_manager, DummyDatasetManager)
+
+    config = build_simulation_configuration()
+    config.update(TEST_COMPONENTS + TEST_CONFIG_DEFAULTS + TEST_CONFIG_CUSTOM_DATASET_MANAGER)
+    manager = load_component_manager(config)
+    assert isinstance(manager, ComponentManager)
     assert isinstance(manager.dataset_manager, MockDatasetManager)
-
-
-@patch('vivarium.framework.components._import_by_path', mock_importer)
-def test_load_component_manager_path():
-    manager = load_component_manager(component_config=yaml.load(TEST_COMPONENTS+TEST_CONFIG_DEFAULTS+TEST_CONFIG_CUSTOM_COMPONENT_MANAGER))
-    assert isinstance(manager, MockComponentManager)
 
 
 def test_extract_component_list():
@@ -161,15 +178,16 @@ def test_parse_component_syntax_error():
         _parse_component(desc, {'Causes': lambda cs: list(cs)})
 
 
-@patch('vivarium.framework.components._import_by_path', mock_importer)
-def test_prep_components():
+def test_prep_components(monkeypatch):
+    monkeypatch.setattr('vivarium.framework.components.import_by_path', mock_importer)
+
     component_descriptions = [
             'test_components.MockComponentA(Placeholder("A Hundred and One Ways to Start a Fight"))',
             'test_components.MockComponentB("Ethel the Aardvark goes Quantity Surveying")',
             'test_components.mock_component_c',
         ]
-
-    components = _prep_components(component_descriptions, {'Placeholder': lambda x: x})
+    config = build_simulation_configuration()
+    components = _prep_components(config, component_descriptions, {'Placeholder': lambda x: x})
     components = {c[0]: c[1] if len(c) == 2 else None for c in components}
 
     assert len(components) == 3
@@ -181,13 +199,11 @@ def test_prep_components():
     assert components[mock_component_c] is None
 
 
-@patch('vivarium.framework.components._extract_component_list')
-@patch('vivarium.framework.components._prep_components')
 def test_ComponentManager__load_component_from_config(_prep_components_mock, _extract_component_list_mock):
     _prep_components_mock.return_value = [(MockComponentA, ['Red Leicester']),
                                           (MockComponentB, []), (mock_component_c,)]
 
-    manager = ComponentManager({}, MockDatasetManager())
+    manager = ComponentManager(ConfigTree(), MockDatasetManager())
 
     manager.load_components_from_config()
 
